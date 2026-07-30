@@ -417,7 +417,7 @@ class BacktestingEngine:
 
             self.output(_("日均收益率：\t{:,.2f}%").format(daily_return))
             self.output(_("收益标准差：\t{:,.2f}%").format(return_std))
-            self.output(f"Sharpe Ratio：\t{sharpe_ratio:,.2f}")
+            self.output(f"夏普比率：\t{sharpe_ratio:,.2f}")
             self.output(_("收益回撤比：\t{:,.2f}").format(return_drawdown_ratio))
 
         statistics: dict = {

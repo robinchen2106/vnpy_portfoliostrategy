@@ -1,4 +1,5 @@
-﻿from datetime import datetime
+﻿import math
+from datetime import datetime
 
 from vnpy.trader.utility import BarGenerator
 from vnpy.trader.utility import ArrayManager
@@ -18,6 +19,7 @@ class Return10Strategy(StrategyTemplate):
     fixed_pos_value = 50000
     return_peroid = 10
     holding_peroid = 10
+    max_positions = 10
 
     signal_ts = {}
     signal_total = {}
@@ -30,6 +32,7 @@ class Return10Strategy(StrategyTemplate):
         "fixed_pos_value",
         "return_peroid",
         "holding_peroid",
+        "max_positions",
     ]
     variables = [
         "signal_ts",
@@ -93,24 +96,54 @@ class Return10Strategy(StrategyTemplate):
             return10 = am.rocp(self.return_peroid)
 
             # 信号
-            if return10 > 0:
+            if isinstance(return10, (int, float)) and not math.isnan(return10) and return10 > 0:
                 self.signal_ts[vt_symbol] = 1
             else:
                 self.signal_ts[vt_symbol] = 0
 
         # 信号汇总，总信号= 时序信号汇总 + 横界面信号汇总
+        # 信号汇总：按 ROCP 排序，只保留 top max_positions 做多，其余平仓
+        candidates: list[tuple[str, float]] = []
+                # 信号汇总：按 ROCP 排序，只保留 top max_positions 做多，其余平仓
+        candidates: list[tuple[str, float]] = []
         for vt_symbol, bar in bars.items():
             self.signal_total[vt_symbol] = self.signal_ts[vt_symbol]
-            self.targets_pos[vt_symbol] = (
-                int(self.fixed_pos_value / bar.close_price)
-                * self.signal_total[vt_symbol]
-            )
+            if self.signal_ts[vt_symbol] > 0:
+                am: ArrayManager = self.ams[vt_symbol]
+                raw_val = am.rocp(self.return_peroid)
+                if isinstance(raw_val, (int, float)) and not math.isnan(raw_val):
+                    candidates.append((vt_symbol, raw_val))
+        candidates.sort(key=lambda x: x[1], reverse=True)
 
+        # 只保留 top max_positions
+        selected: set[str] = {s for s, _ in candidates[: self.max_positions]}
+        for vt_symbol in self.vt_symbols:
+            if vt_symbol in selected:
+                self.signal_total[vt_symbol] = 1
+            else:
+                self.signal_total[vt_symbol] = 0
+
+        # 计算目标仓位
+        for vt_symbol, bar in bars.items():
+            if (isinstance(bar.close_price, (int, float))
+                    and not math.isnan(bar.close_price)
+                    and bar.close_price > 0):
+                self.targets_pos[vt_symbol] = (
+                    int(self.fixed_pos_value / bar.close_price)
+                    * self.signal_total[vt_symbol]
+                )
+            else:
+                self.targets_pos[vt_symbol] = 0
         # 交易执行
         if self.trade_day == 0 or not self.trade_day % self.holding_peroid:
             for vt_symbol in self.vt_symbols:
                 bar = bars.get(vt_symbol)
                 if not bar:
+                    continue
+                # 容错：跳过收盘价无效的标的
+                if (not isinstance(bar.close_price, (int, float))
+                        or math.isnan(bar.close_price)
+                        or bar.close_price <= 0):
                     continue
 
                 target_pos = self.targets_pos[vt_symbol]

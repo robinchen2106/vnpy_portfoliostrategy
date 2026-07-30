@@ -1,6 +1,6 @@
-from datetime import datetime
+﻿from datetime import datetime
 
-from rs_czsc import BarGenerator
+from vnpy.trader.utility import BarGenerator
 from vnpy.trader.utility import ArrayManager
 from vnpy.trader.object import TickData, BarData
 from vnpy.trader.constant import Direction, Interval
@@ -14,8 +14,8 @@ class Return10Strategy(StrategyTemplate):
 
     author = "Robin"
 
-    price_add_percent = 0.05
-    fixed_pos_value = 100000
+    price_add_percent = 0.005
+    fixed_pos_value = 50000
     return_peroid = 10
     holding_peroid = 10
 
@@ -95,8 +95,6 @@ class Return10Strategy(StrategyTemplate):
             # 信号
             if return10 > 0:
                 self.signal_ts[vt_symbol] = 1
-            elif return10 < 0:
-                self.signal_ts[vt_symbol] = -1
             else:
                 self.signal_ts[vt_symbol] = 0
 

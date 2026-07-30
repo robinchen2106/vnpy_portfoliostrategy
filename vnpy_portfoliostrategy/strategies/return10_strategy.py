@@ -90,7 +90,7 @@ class Return10Strategy(StrategyTemplate):
             am.update_bar(bar)
 
             # 信号 过去10天的收益率
-            return10 = am.rocp(self.retunr_peroid)
+            return10 = am.rocp(self.return_peroid)
 
             # 信号
             if return10 > 0:

@@ -129,7 +129,7 @@ class Return10Strategy(StrategyTemplate):
                     and not math.isnan(bar.close_price)
                     and bar.close_price > 0):
                 self.targets_pos[vt_symbol] = (
-                    int(self.fixed_pos_value / bar.close_price)
+                    int(self.fixed_pos_value / bar.close_price/100)*100
                     * self.signal_total[vt_symbol]
                 )
             else:

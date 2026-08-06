@@ -1,13 +1,11 @@
 ﻿import math
-from datetime import datetime
+from time import monotonic
 
-from vnpy.trader.utility import BarGenerator
 from vnpy.trader.utility import ArrayManager
 from vnpy.trader.object import TickData, BarData
-from vnpy.trader.constant import Direction, Interval
+from vnpy.trader.constant import Interval
 
 from vnpy_portfoliostrategy import StrategyTemplate, StrategyEngine
-from vnpy_portfoliostrategy.utility import PortfolioBarGenerator
 
 
 class Return10Strategy(StrategyTemplate):
@@ -20,12 +18,14 @@ class Return10Strategy(StrategyTemplate):
     return_peroid = 10
     holding_peroid = 10
     max_positions = 10
+    close_wait_seconds = 3.0
 
-    signal_ts = {}
-    signal_total = {}
-    last_tick_time: datetime = None
-    trade_day = 0
-    targets_pos = {}
+    signal_ts: dict[str, int] = {}
+    signal_total: dict[str, int] = {}
+    last_tick_time: str = ""
+    trade_day: int = 0
+    targets_pos: dict[str, int] = {}
+    last_daily_bar_date: str = ""
 
     parameters = [
         "price_add_percent",
@@ -33,6 +33,7 @@ class Return10Strategy(StrategyTemplate):
         "return_peroid",
         "holding_peroid",
         "max_positions",
+        "close_wait_seconds",
     ]
     variables = [
         "signal_ts",
@@ -40,6 +41,7 @@ class Return10Strategy(StrategyTemplate):
         "last_tick_time",
         "trade_day",
         "targets_pos",
+        "last_daily_bar_date",
     ]
 
     def __init__(
@@ -52,19 +54,24 @@ class Return10Strategy(StrategyTemplate):
         """构造函数"""
         super().__init__(strategy_engine, strategy_name, vt_symbols, setting)
 
-        self.bgs: dict[str, BarGenerator] = {}
+        # 使用实例级容器，避免多个策略实例共享类变量中的可变状态。
+        self.signal_ts = {}
+        self.signal_total = {}
+        self.last_tick_time = ""
+        self.trade_day = 0
+        self.targets_pos = {}
+        self.last_daily_bar_date = ""
+
         self.ams: dict[str, ArrayManager] = {}
-
         for vt_symbol in self.vt_symbols:
-
-            def on_bar(bar: BarData):
-                """"""
-                pass
-
-            self.bgs[vt_symbol] = BarGenerator(on_bar)
             self.ams[vt_symbol] = ArrayManager()
 
-        self.pbg = PortfolioBarGenerator(self.on_bars)
+        # XT 为每个标的单独推送收盘 Tick，定时事件会在行情安静后
+        # 将这些 Tick 汇总成一次组合日线切片。
+        self.latest_ticks: dict[str, TickData] = {}
+        self.closed_symbols: set[str] = set()
+        self.collecting_date: str = ""
+        self.last_close_tick_at: float = 0.0
 
     def on_init(self) -> None:
         """策略初始化回调"""
@@ -82,12 +89,105 @@ class Return10Strategy(StrategyTemplate):
 
     def on_tick(self, tick: TickData) -> None:
         """行情推送回调"""
-        pass
+        self.last_tick_time = tick.datetime.isoformat()
+        self.latest_ticks[tick.vt_symbol] = tick
+
+        extra: dict = tick.extra or {}
+        if not extra.get("market_closed", False):
+            return
+
+        trading_date: str = tick.datetime.date().isoformat()
+        if trading_date == self.last_daily_bar_date:
+            return
+
+        if trading_date != self.collecting_date:
+            self.collecting_date = trading_date
+            self.closed_symbols.clear()
+
+        self.closed_symbols.add(tick.vt_symbol)
+        self.last_close_tick_at = monotonic()
+
+    def on_timer(self) -> None:
+        """收齐收盘 Tick 后生成一次日线组合切片"""
+        if not self.trading or not self.collecting_date:
+            return
+
+        if self.collecting_date == self.last_daily_bar_date:
+            return
+
+        all_closed: bool = len(self.closed_symbols) >= len(self.vt_symbols)
+        wait_elapsed: bool = (
+            monotonic() - self.last_close_tick_at >= self.close_wait_seconds
+        )
+        if not all_closed and not wait_elapsed:
+            return
+
+        bars: dict[str, BarData] = {}
+        for vt_symbol in self.vt_symbols:
+            tick: TickData | None = self.latest_ticks.get(vt_symbol)
+            if not tick or tick.datetime.date().isoformat() != self.collecting_date:
+                continue
+
+            bar: BarData | None = self._create_daily_bar(tick)
+            if bar:
+                bars[vt_symbol] = bar
+
+        if not bars:
+            self.write_log(f"{self.collecting_date} 没有有效收盘行情，跳过日线计算")
+            self._clear_close_collection()
+            return
+
+        self.last_daily_bar_date = self.collecting_date
+        missing_count: int = len(self.vt_symbols) - len(bars)
+        self.write_log(
+            f"{self.collecting_date} 收盘日线切片完成："
+            f"有效{len(bars)}，缺失{missing_count}"
+        )
+
+        self.on_bars(bars)
+        self.sync_data()
+        self._clear_close_collection()
+
+    @staticmethod
+    def _create_daily_bar(tick: TickData) -> BarData | None:
+        """使用 XT Tick 中携带的当日 OHLC 构造日线"""
+        close_price: float = tick.last_price
+        if (
+            not isinstance(close_price, (int, float))
+            or math.isnan(close_price)
+            or close_price <= 0
+        ):
+            return None
+
+        open_price: float = tick.open_price if tick.open_price > 0 else close_price
+        high_price: float = tick.high_price if tick.high_price > 0 else close_price
+        low_price: float = tick.low_price if tick.low_price > 0 else close_price
+
+        return BarData(
+            symbol=tick.symbol,
+            exchange=tick.exchange,
+            datetime=tick.datetime.replace(hour=0, minute=0, second=0, microsecond=0),
+            interval=Interval.DAILY,
+            volume=tick.volume,
+            turnover=tick.turnover,
+            open_interest=tick.open_interest,
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            close_price=close_price,
+            gateway_name=tick.gateway_name,
+        )
+
+    def _clear_close_collection(self) -> None:
+        """清理已完成的收盘行情缓存"""
+        self.closed_symbols.clear()
+        self.collecting_date = ""
+        self.last_close_tick_at = 0.0
 
     def on_bars(self, bars: dict[str, BarData]) -> None:
         """K线切片回调"""
         self.cancel_all()
-        # 更新K线计算RSI数值
+        # 更新K线并计算收益率信号
         for vt_symbol, bar in bars.items():
             am: ArrayManager = self.ams[vt_symbol]
             am.update_bar(bar)
@@ -101,10 +201,7 @@ class Return10Strategy(StrategyTemplate):
             else:
                 self.signal_ts[vt_symbol] = 0
 
-        # 信号汇总，总信号= 时序信号汇总 + 横界面信号汇总
         # 信号汇总：按 ROCP 排序，只保留 top max_positions 做多，其余平仓
-        candidates: list[tuple[str, float]] = []
-                # 信号汇总：按 ROCP 排序，只保留 top max_positions 做多，其余平仓
         candidates: list[tuple[str, float]] = []
         for vt_symbol, bar in bars.items():
             self.signal_total[vt_symbol] = self.signal_ts[vt_symbol]

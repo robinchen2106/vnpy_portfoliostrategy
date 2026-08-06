@@ -599,8 +599,8 @@ class BacktestingEngine:
                 )
                 self.bars[vt_symbol] = bar
 
-        self.cross_limit_order()
         self.strategy.on_bars(bars)
+        self.cross_limit_order()
 
         if self.strategy.inited:
             self.update_daily_close(self.bars, dt)

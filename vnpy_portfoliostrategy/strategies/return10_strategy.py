@@ -29,8 +29,8 @@ class Return10Strategy(StrategyTemplate):
 
     price_add_percent = 0.005
     fixed_pos_value = 50000
-    return_peroid = 10
-    holding_peroid = 10
+    return_period = 10
+    holding_period = 10
     max_positions = 10
     close_wait_seconds = 3.0
 
@@ -44,8 +44,8 @@ class Return10Strategy(StrategyTemplate):
     parameters = [
         "price_add_percent",
         "fixed_pos_value",
-        "return_peroid",
-        "holding_peroid",
+        "return_period",
+        "holding_period",
         "max_positions",
         "close_wait_seconds",
     ]
@@ -267,8 +267,8 @@ class Return10Strategy(StrategyTemplate):
             self.executed_date = d
             self.pending_targets = None
 
-        # 2) 收盘计算信号：调仓日（每 holding_peroid 个交易日）
-        if self.trade_day % self.holding_peroid == 0:
+        # 2) 收盘计算信号：调仓日（每 holding_period 个交易日）
+        if self.trade_day % self.holding_period == 0:
             self.pending_targets = self._calc_targets(bars)
 
         self.trade_day += 1
@@ -314,7 +314,7 @@ class Return10Strategy(StrategyTemplate):
 
         if all_received or elapsed > AGGREGATE_TIMEOUT:
             # 收盘计算信号：调仓日（与回测 trade_day 语义一致）
-            if self.trade_day % self.holding_peroid == 0:
+            if self.trade_day % self.holding_period == 0:
                 self.pending_targets = self._calc_targets(self.daily_pending)
             self.trade_day += 1
             self.daily_pending = {}
@@ -331,7 +331,7 @@ class Return10Strategy(StrategyTemplate):
             am: ArrayManager = self.ams[vt_symbol]
             am.update_bar(bar)
 
-            return10 = am.rocp(self.return_peroid)
+            return10 = am.rocp(self.return_period)
             if (
                 isinstance(return10, (int, float))
                 and not math.isnan(return10)
@@ -348,7 +348,7 @@ class Return10Strategy(StrategyTemplate):
             self.signal_total[vt_symbol] = self.signal_ts[vt_symbol]
             if self.signal_ts[vt_symbol] > 0:
                 am = self.ams[vt_symbol]
-                raw_val = am.rocp(self.return_peroid)
+                raw_val = am.rocp(self.return_period)
                 if isinstance(raw_val, (int, float)) and not math.isnan(raw_val):
                     candidates.append((vt_symbol, raw_val))
         candidates.sort(key=lambda x: x[1], reverse=True)

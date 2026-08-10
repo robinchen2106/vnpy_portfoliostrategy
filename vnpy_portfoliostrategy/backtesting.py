@@ -7,6 +7,7 @@ import traceback
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import pandas as pd
 from pandas import DataFrame
 from collections.abc import Callable
 
@@ -47,6 +48,9 @@ class BacktestingEngine:
 
         self.rates: dict[str, float]
         self.slippages: dict[str, float]
+        self.minimum_commissions: dict[str, float]
+        self.stamp_tax_rates: dict[str, float]
+        self.slippage_rates: dict[str, float]
         self.sizes: dict[str, float]
         self.priceticks: dict[str, float]
 
@@ -101,14 +105,46 @@ class BacktestingEngine:
         capital: float = 0,
         end: datetime | None = None,
         risk_free: float = 0,
-        annual_days: int = 240
+        annual_days: int = 240,
+        minimum_commissions: dict[str, float] | None = None,
+        stamp_tax_rates: dict[str, float] | None = None,
+        slippage_rates: dict[str, float] | None = None,
     ) -> None:
-        """设置参数"""
+        """设置回测参数和逐笔费用模型。"""
         self.vt_symbols = vt_symbols
         self.interval = interval
 
         self.rates = rates
         self.slippages = slippages
+        self.minimum_commissions = {
+            vt_symbol: 0.0
+            for vt_symbol in vt_symbols
+        }
+        if minimum_commissions:
+            self.minimum_commissions.update(minimum_commissions)
+
+        self.stamp_tax_rates = {
+            vt_symbol: 0.0
+            for vt_symbol in vt_symbols
+        }
+        if stamp_tax_rates:
+            self.stamp_tax_rates.update(stamp_tax_rates)
+
+        self.slippage_rates = {
+            vt_symbol: 0.0
+            for vt_symbol in vt_symbols
+        }
+        if slippage_rates:
+            self.slippage_rates.update(slippage_rates)
+
+        for fee_map in (
+            self.minimum_commissions,
+            self.stamp_tax_rates,
+            self.slippage_rates,
+        ):
+            if any(value < 0 for value in fee_map.values()):
+                raise ValueError("费用参数不能为负数")
+
         self.sizes = sizes
         self.priceticks = priceticks
 
@@ -263,6 +299,9 @@ class BacktestingEngine:
                 self.sizes,
                 self.rates,
                 self.slippages,
+                self.minimum_commissions,
+                self.stamp_tax_rates,
+                self.slippage_rates,
             )
 
             pre_closes = daily_result.close_prices
@@ -273,7 +312,8 @@ class BacktestingEngine:
         for daily_result in self.daily_results.values():
             fields: list = [
                 "date", "trade_count", "turnover",
-                "commission", "slippage", "trading_pnl",
+                "commission", "broker_commission", "stamp_tax",
+                "slippage", "trading_pnl",
                 "holding_pnl", "total_pnl", "net_pnl"
             ]
             for key in fields:
@@ -307,8 +347,13 @@ class BacktestingEngine:
         daily_net_pnl: float = 0
         total_commission: float = 0
         daily_commission: float = 0
+        total_broker_commission: float = 0
+        daily_broker_commission: float = 0
+        total_stamp_tax: float = 0
+        daily_stamp_tax: float = 0
         total_slippage: float = 0
         daily_slippage: float = 0
+        total_transaction_cost: float = 0
         total_turnover: float = 0
         daily_turnover: float = 0
         total_trade_count: int = 0
@@ -362,8 +407,24 @@ class BacktestingEngine:
             total_commission = df["commission"].sum()
             daily_commission = total_commission / total_days
 
+            broker_commission_series = (
+                df["broker_commission"]
+                if "broker_commission" in df
+                else df["commission"]
+            )
+            stamp_tax_series = (
+                df["stamp_tax"]
+                if "stamp_tax" in df
+                else pd.Series(0.0, index=df.index)
+            )
+            total_broker_commission = broker_commission_series.sum()
+            daily_broker_commission = total_broker_commission / total_days
+            total_stamp_tax = stamp_tax_series.sum()
+            daily_stamp_tax = total_stamp_tax / total_days
+
             total_slippage = df["slippage"].sum()
             daily_slippage = total_slippage / total_days
+            total_transaction_cost = total_commission + total_slippage
 
             total_turnover = df["turnover"].sum()
             daily_turnover = total_turnover / total_days
@@ -405,12 +466,17 @@ class BacktestingEngine:
 
             self.output(_("总盈亏：\t{:,.2f}").format(total_net_pnl))
             self.output(_("总手续费：\t{:,.2f}").format(total_commission))
+            self.output(_("其中双边佣金：\t{:,.2f}").format(total_broker_commission))
+            self.output(_("其中印花税：\t{:,.2f}").format(total_stamp_tax))
             self.output(_("总滑点：\t{:,.2f}").format(total_slippage))
+            self.output(_("总交易成本：\t{:,.2f}").format(total_transaction_cost))
             self.output(_("总成交金额：\t{:,.2f}").format(total_turnover))
             self.output(_("总成交笔数：\t{}").format(total_trade_count))
 
             self.output(_("日均盈亏：\t{:,.2f}").format(daily_net_pnl))
             self.output(_("日均手续费：\t{:,.2f}").format(daily_commission))
+            self.output(_("日均双边佣金：\t{:,.2f}").format(daily_broker_commission))
+            self.output(_("日均印花税：\t{:,.2f}").format(daily_stamp_tax))
             self.output(_("日均滑点：\t{:,.2f}").format(daily_slippage))
             self.output(_("日均成交金额：\t{:,.2f}").format(daily_turnover))
             self.output(_("日均成交笔数：\t{}").format(daily_trade_count))
@@ -435,8 +501,13 @@ class BacktestingEngine:
             "daily_net_pnl": daily_net_pnl,
             "total_commission": total_commission,
             "daily_commission": daily_commission,
+            "total_broker_commission": total_broker_commission,
+            "daily_broker_commission": daily_broker_commission,
+            "total_stamp_tax": total_stamp_tax,
+            "daily_stamp_tax": daily_stamp_tax,
             "total_slippage": total_slippage,
             "daily_slippage": daily_slippage,
+            "total_transaction_cost": total_transaction_cost,
             "total_turnover": total_turnover,
             "daily_turnover": daily_turnover,
             "total_trade_count": total_trade_count,
@@ -783,6 +854,8 @@ class ContractDailyResult:
         self.end_pos: float = 0
 
         self.turnover: float = 0
+        self.broker_commission: float = 0
+        self.stamp_tax: float = 0
         self.commission: float = 0
         self.slippage: float = 0
 
@@ -801,7 +874,10 @@ class ContractDailyResult:
         start_pos: float,
         size: float,
         rate: float,
-        slippage: float
+        slippage: float,
+        minimum_commission: float = 0,
+        stamp_tax_rate: float = 0,
+        slippage_rate: float = 0,
     ) -> None:
         """计算盈亏"""
         # 记录昨收盘价
@@ -828,8 +904,18 @@ class ContractDailyResult:
 
             self.trading_pnl += pos_change * (self.close_price - trade.price) * size
             self.slippage += trade.volume * size * slippage
+            self.slippage += round(turnover * slippage_rate, 2)
             self.turnover += turnover
-            self.commission += turnover * rate
+
+            broker_commission = turnover * rate
+            if minimum_commission > 0:
+                broker_commission = max(broker_commission, minimum_commission)
+            self.broker_commission += round(broker_commission, 2)
+
+            if trade.direction == Direction.SHORT:
+                self.stamp_tax += round(turnover * stamp_tax_rate, 2)
+
+        self.commission = self.broker_commission + self.stamp_tax
 
         # 计算每日盈亏
         self.total_pnl = self.trading_pnl + self.holding_pnl
@@ -858,6 +944,8 @@ class PortfolioDailyResult:
 
         self.trade_count: int = 0
         self.turnover: float = 0
+        self.broker_commission: float = 0
+        self.stamp_tax: float = 0
         self.commission: float = 0
         self.slippage: float = 0
         self.trading_pnl: float = 0
@@ -877,6 +965,9 @@ class PortfolioDailyResult:
         sizes: dict[str, float],
         rates: dict[str, float],
         slippages: dict[str, float],
+        minimum_commissions: dict[str, float] | None = None,
+        stamp_tax_rates: dict[str, float] | None = None,
+        slippage_rates: dict[str, float] | None = None,
     ) -> None:
         """计算盈亏"""
         self.pre_closes = pre_closes
@@ -888,11 +979,16 @@ class PortfolioDailyResult:
                 start_poses.get(vt_symbol, 0),
                 sizes[vt_symbol],
                 rates[vt_symbol],
-                slippages[vt_symbol]
+                slippages[vt_symbol],
+                (minimum_commissions or {}).get(vt_symbol, 0),
+                (stamp_tax_rates or {}).get(vt_symbol, 0),
+                (slippage_rates or {}).get(vt_symbol, 0),
             )
 
             self.trade_count += contract_result.trade_count
             self.turnover += contract_result.turnover
+            self.broker_commission += contract_result.broker_commission
+            self.stamp_tax += contract_result.stamp_tax
             self.commission += contract_result.commission
             self.slippage += contract_result.slippage
             self.trading_pnl += contract_result.trading_pnl
@@ -945,7 +1041,10 @@ def evaluate(
     priceticks: dict[str, float],
     capital: float,
     end: datetime,
-    setting: dict
+    setting: dict,
+    minimum_commissions: dict[str, float] | None = None,
+    stamp_tax_rates: dict[str, float] | None = None,
+    slippage_rates: dict[str, float] | None = None,
 ) -> tuple:
     """包装回测相关函数以供进程池内运行"""
     engine: BacktestingEngine = BacktestingEngine()
@@ -960,6 +1059,9 @@ def evaluate(
         priceticks=priceticks,
         capital=capital,
         end=end,
+        minimum_commissions=minimum_commissions,
+        stamp_tax_rates=stamp_tax_rates,
+        slippage_rates=slippage_rates,
     )
 
     engine.add_strategy(strategy_class, setting)
@@ -986,7 +1088,10 @@ def wrap_evaluate(engine: BacktestingEngine, target_name: str) -> Callable:
         engine.sizes,
         engine.priceticks,
         engine.capital,
-        engine.end
+        engine.end,
+        minimum_commissions=engine.minimum_commissions,
+        stamp_tax_rates=engine.stamp_tax_rates,
+        slippage_rates=engine.slippage_rates,
     )
     return func
 

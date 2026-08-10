@@ -2,7 +2,7 @@
 from datetime import date, datetime, time
 from time import monotonic
 
-from vnpy.trader.utility import ArrayManager
+from vnpy.trader.utility import ArrayManager, BarGenerator
 from vnpy.trader.object import TickData, BarData
 from vnpy.trader.constant import Interval
 from vnpy.trader.constant import Interval
@@ -77,6 +77,7 @@ class Return10Strategy(StrategyTemplate):
         self.last_daily_bar_date = ""
 
         self.ams: dict[str, ArrayManager] = {}
+        self.bgs: dict[str, BarGenerator] = {}
         # 实盘：各标的日线生成器（从分钟K线合成日线）
         self.daily_bgs: dict[str, BarGenerator] = {}
 

@@ -45,6 +45,8 @@ class BacktestingEngine:
         self.vt_symbols: list[str] = []
         self.start: datetime
         self.end: datetime
+        self.warmup_start: datetime
+        self.trading_start: datetime | None
 
         self.rates: dict[str, float]
         self.slippages: dict[str, float]
@@ -109,6 +111,8 @@ class BacktestingEngine:
         minimum_commissions: dict[str, float] | None = None,
         stamp_tax_rates: dict[str, float] | None = None,
         slippage_rates: dict[str, float] | None = None,
+        warmup_start: datetime | None = None,
+        trading_start: datetime | None = None,
     ) -> None:
         """设置回测参数和逐笔费用模型。"""
         self.vt_symbols = vt_symbols
@@ -148,11 +152,19 @@ class BacktestingEngine:
         self.sizes = sizes
         self.priceticks = priceticks
 
-        self.start = start
+        self.warmup_start = warmup_start or start
+        self.trading_start = trading_start
+        if self.trading_start is not None and self.warmup_start >= self.trading_start:
+            raise ValueError("warmup_start must be earlier than trading_start")
+
+        self.start = self.warmup_start
         if not end:
             self.end = datetime.now()
         else:
             self.end = end.replace(hour=23, minute=59, second=59)
+
+        if self.trading_start is not None and self.trading_start >= self.end:
+            raise ValueError("trading_start must be earlier than the backtest end")
 
         self.capital = capital
         self.risk_free = risk_free
@@ -235,6 +247,10 @@ class BacktestingEngine:
         self.output(_("所有历史数据加载完成"))
 
     def run_backtesting(self) -> None:
+        if self.trading_start is not None:
+            self._run_backtesting_with_warmup()
+            return
+
         """开始回测"""
         self.strategy.on_init()
 
@@ -275,6 +291,47 @@ class BacktestingEngine:
                 return
 
         self.output(_("历史数据回放结束"))
+
+    def _run_backtesting_with_warmup(self) -> None:
+        """Warm indicators before enabling orders and daily result accounting."""
+        self.strategy.on_init()
+        dts = sorted(self.dts)
+        trading_start_date = self.trading_start.date()
+        warmup_dts = [dt for dt in dts if dt.date() < trading_start_date]
+        trading_dts = [dt for dt in dts if dt.date() >= trading_start_date]
+
+        if not warmup_dts:
+            raise RuntimeError("no historical bars available for warmup")
+        if not trading_dts:
+            raise RuntimeError("no historical bars available for formal trading")
+
+        self.output(
+            f"indicator warmup: {warmup_dts[0].date()} to {warmup_dts[-1].date()} "
+            f"({len(warmup_dts)} bars)"
+        )
+        for dt in warmup_dts:
+            try:
+                self.new_bars(dt)
+            except Exception:
+                self.output("exception during warmup; backtest stopped")
+                self.output(traceback.format_exc())
+                return
+
+        self.strategy.inited = True
+        self.output("strategy initialization completed")
+        self.strategy.on_start()
+        self.strategy.trading = True
+        self.output(f"formal backtest starts at {self.trading_start.date()}")
+
+        for dt in trading_dts:
+            try:
+                self.new_bars(dt)
+            except Exception:
+                self.output("exception during formal backtest; backtest stopped")
+                self.output(traceback.format_exc())
+                return
+
+        self.output("historical data replay completed")
 
     def calculate_result(self) -> DataFrame:
         """计算逐日盯市盈亏"""
@@ -1045,6 +1102,8 @@ def evaluate(
     minimum_commissions: dict[str, float] | None = None,
     stamp_tax_rates: dict[str, float] | None = None,
     slippage_rates: dict[str, float] | None = None,
+    warmup_start: datetime | None = None,
+    trading_start: datetime | None = None,
 ) -> tuple:
     """包装回测相关函数以供进程池内运行"""
     engine: BacktestingEngine = BacktestingEngine()
@@ -1062,6 +1121,8 @@ def evaluate(
         minimum_commissions=minimum_commissions,
         stamp_tax_rates=stamp_tax_rates,
         slippage_rates=slippage_rates,
+        warmup_start=warmup_start,
+        trading_start=trading_start,
     )
 
     engine.add_strategy(strategy_class, setting)
@@ -1092,6 +1153,8 @@ def wrap_evaluate(engine: BacktestingEngine, target_name: str) -> Callable:
         minimum_commissions=engine.minimum_commissions,
         stamp_tax_rates=engine.stamp_tax_rates,
         slippage_rates=engine.slippage_rates,
+        warmup_start=engine.warmup_start,
+        trading_start=engine.trading_start,
     )
     return func
 

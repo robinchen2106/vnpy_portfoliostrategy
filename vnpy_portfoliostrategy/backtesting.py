@@ -27,6 +27,9 @@ from .locale import _
 from .template import StrategyTemplate
 
 
+DEFAULT_SLIPPAGE_RATE: float = 3 / 10_000
+
+
 INTERVAL_DELTA_MAP: dict[Interval, timedelta] = {
     Interval.MINUTE: timedelta(minutes=1),
     Interval.HOUR: timedelta(hours=1),
@@ -135,7 +138,7 @@ class BacktestingEngine:
             self.stamp_tax_rates.update(stamp_tax_rates)
 
         self.slippage_rates = {
-            vt_symbol: 0.0
+            vt_symbol: DEFAULT_SLIPPAGE_RATE
             for vt_symbol in vt_symbols
         }
         if slippage_rates:
@@ -934,7 +937,7 @@ class ContractDailyResult:
         slippage: float,
         minimum_commission: float = 0,
         stamp_tax_rate: float = 0,
-        slippage_rate: float = 0,
+        slippage_rate: float = DEFAULT_SLIPPAGE_RATE,
     ) -> None:
         """计算盈亏"""
         # 记录昨收盘价
@@ -1039,7 +1042,7 @@ class PortfolioDailyResult:
                 slippages[vt_symbol],
                 (minimum_commissions or {}).get(vt_symbol, 0),
                 (stamp_tax_rates or {}).get(vt_symbol, 0),
-                (slippage_rates or {}).get(vt_symbol, 0),
+                (slippage_rates or {}).get(vt_symbol, DEFAULT_SLIPPAGE_RATE),
             )
 
             self.trade_count += contract_result.trade_count

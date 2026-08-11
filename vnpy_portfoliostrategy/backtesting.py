@@ -50,6 +50,8 @@ class BacktestingEngine:
         self.end: datetime
         self.warmup_start: datetime
         self.trading_start: datetime | None
+        self.benchmark_symbol: str | None = None
+        self.benchmark_data: list[BarData] = []
 
         self.rates: dict[str, float]
         self.slippages: dict[str, float]
@@ -62,6 +64,7 @@ class BacktestingEngine:
         self.capital: float = 1_000_000
         self.risk_free: float = 0
         self.annual_days: int = 240
+        self.half_life: int = 120
 
         self.strategy_class: type[StrategyTemplate]
         self.strategy: StrategyTemplate
@@ -116,6 +119,8 @@ class BacktestingEngine:
         slippage_rates: dict[str, float] | None = None,
         warmup_start: datetime | None = None,
         trading_start: datetime | None = None,
+        benchmark_symbol: str | None = None,
+        half_life: int = 120,
     ) -> None:
         """设置回测参数和逐笔费用模型。"""
         self.vt_symbols = vt_symbols
@@ -157,6 +162,8 @@ class BacktestingEngine:
 
         self.warmup_start = warmup_start or start
         self.trading_start = trading_start
+        self.benchmark_symbol = benchmark_symbol
+        self.benchmark_data.clear()
         if self.trading_start is not None and self.warmup_start >= self.trading_start:
             raise ValueError("warmup_start must be earlier than trading_start")
 
@@ -172,6 +179,7 @@ class BacktestingEngine:
         self.capital = capital
         self.risk_free = risk_free
         self.annual_days = annual_days
+        self.half_life = half_life
 
     def add_strategy(self, strategy_class: type[StrategyTemplate], setting: dict) -> None:
         """增加策略"""
@@ -194,6 +202,7 @@ class BacktestingEngine:
         # 清理上次加载的历史数据
         self.history_data.clear()
         self.dts.clear()
+        self.benchmark_data.clear()
 
         # 每次加载30天历史数据
         progress_delta: timedelta = timedelta(days=30)
@@ -246,6 +255,31 @@ class BacktestingEngine:
                 data_count = len(data)
 
             self.output(_("{}历史数据加载完成，数据量：{}").format(vt_symbol, data_count))
+
+        if self.benchmark_symbol:
+            if self.benchmark_symbol in self.vt_symbols:
+                self.benchmark_data = sorted(
+                    (
+                        bar
+                        for (_, history_symbol), bar in self.history_data.items()
+                        if history_symbol == self.benchmark_symbol
+                    ),
+                    key=lambda bar: bar.datetime,
+                )
+            else:
+                self.benchmark_data = load_bar_data(
+                    self.benchmark_symbol,
+                    self.interval,
+                    self.start,
+                    self.end,
+                )
+
+            self.output(
+                _("{}基准数据加载完成，数据量：{}").format(
+                    self.benchmark_symbol,
+                    len(self.benchmark_data),
+                )
+            )
 
         self.output(_("所有历史数据加载完成"))
 
@@ -423,7 +457,11 @@ class BacktestingEngine:
         daily_return: float = 0
         return_std: float = 0
         sharpe_ratio: float = 0
+        ewm_sharpe: float = 0
         return_drawdown_ratio: float = 0
+        rgr_ratio: float = 0
+        benchmark_return: float = 0
+        excess_return: float = 0
 
         # 检查是否发生过爆仓
         positive_balance: bool = False
@@ -500,10 +538,64 @@ class BacktestingEngine:
             if return_std:
                 daily_risk_free: float = self.risk_free / np.sqrt(self.annual_days)
                 sharpe_ratio = (daily_return - daily_risk_free) / return_std * np.sqrt(self.annual_days)
+
+                ewm_window = df["return"].ewm(halflife=self.half_life)
+                ewm_mean = ewm_window.mean() * 100
+                ewm_std = ewm_window.std() * 100
+                ewm_sharpe = (
+                    (ewm_mean - daily_risk_free) / ewm_std
+                ).iloc[-1] * np.sqrt(self.annual_days)
             else:
                 sharpe_ratio = 0
+                ewm_sharpe = 0
 
             return_drawdown_ratio = -total_net_pnl / max_drawdown
+
+            if self.benchmark_data:
+                statistics_start: date = pd.Timestamp(start_date).date()
+                statistics_end: date = pd.Timestamp(end_date).date()
+                benchmark_bars: list[BarData] = sorted(
+                    (
+                        bar
+                        for bar in self.benchmark_data
+                        if statistics_start <= bar.datetime.date() <= statistics_end
+                    ),
+                    key=lambda bar: bar.datetime,
+                )
+
+                if benchmark_bars:
+                    start_open: float = benchmark_bars[0].open_price
+                    end_close: float = benchmark_bars[-1].close_price
+                    if start_open and end_close:
+                        benchmark_return = (end_close / start_open - 1) * 100
+
+            excess_return = total_return - benchmark_return
+
+            cagr_value: float = annual_return / 100
+            if return_std > 0:
+                stability_return: float = 1 / (1 + return_std / 100)
+            else:
+                stability_return = 0
+
+            returns_series = df["return"]
+            downside_diff: np.ndarray = np.minimum(returns_series.values, 0.0)
+            downside_std: float = np.sqrt(np.mean(downside_diff**2))
+            annual_downside_risk: float = downside_std * np.sqrt(252)
+            return_skew: float = float(returns_series.skew())
+            return_kurt: float = float(returns_series.kurt())
+            sorted_returns: np.ndarray = np.sort(returns_series.values)
+            cutoff_index: int = int(np.ceil(len(sorted_returns) * 0.05))
+            cvar_95: float = np.mean(sorted_returns[:cutoff_index])
+
+            rgr_ratio = calc_rgr_ratio(
+                cagr_value,
+                stability_return,
+                annual_downside_risk,
+                max_ddpercent,
+                return_skew,
+                return_kurt,
+                cvar_95,
+            )
 
         # 输出结果
         if output:
@@ -519,6 +611,8 @@ class BacktestingEngine:
             self.output(_("结束资金：\t{:,.2f}").format(end_balance))
 
             self.output(_("总收益率：\t{:,.2f}%").format(total_return))
+            self.output(_("基准收益率：\t{:,.2f}%").format(benchmark_return))
+            self.output(_("超额收益率：\t{:,.2f}%").format(excess_return))
             self.output(_("年化收益：\t{:,.2f}%").format(annual_return))
             self.output(_("最大回撤: \t{:,.2f}").format(max_drawdown))
             self.output(_("百分比最大回撤: {:,.2f}%").format(max_ddpercent))
@@ -543,8 +637,10 @@ class BacktestingEngine:
 
             self.output(_("日均收益率：\t{:,.2f}%").format(daily_return))
             self.output(_("收益标准差：\t{:,.2f}%").format(return_std))
-            self.output(f"夏普比率：\t{sharpe_ratio:,.2f}")
+            self.output(f"Sharpe Ratio：\t{sharpe_ratio:,.2f}")
+            self.output(f"EWM Sharpe：\t{ewm_sharpe:,.2f}")
             self.output(_("收益回撤比：\t{:,.2f}").format(return_drawdown_ratio))
+            self.output(f"RGR Ratio：\t{rgr_ratio:,.2f}")
 
         statistics: dict = {
             "start_date": start_date,
@@ -573,11 +669,15 @@ class BacktestingEngine:
             "total_trade_count": total_trade_count,
             "daily_trade_count": daily_trade_count,
             "total_return": total_return,
+            "benchmark_return": benchmark_return,
+            "excess_return": excess_return,
             "annual_return": annual_return,
             "daily_return": daily_return,
             "return_std": return_std,
             "sharpe_ratio": sharpe_ratio,
+            "ewm_sharpe": ewm_sharpe,
             "return_drawdown_ratio": return_drawdown_ratio,
+            "rgr_ratio": rgr_ratio,
         }
 
         # 过滤极值
@@ -1107,6 +1207,8 @@ def evaluate(
     slippage_rates: dict[str, float] | None = None,
     warmup_start: datetime | None = None,
     trading_start: datetime | None = None,
+    benchmark_symbol: str | None = None,
+    half_life: int = 120,
 ) -> tuple:
     """包装回测相关函数以供进程池内运行"""
     engine: BacktestingEngine = BacktestingEngine()
@@ -1126,6 +1228,8 @@ def evaluate(
         slippage_rates=slippage_rates,
         warmup_start=warmup_start,
         trading_start=trading_start,
+        benchmark_symbol=benchmark_symbol,
+        half_life=half_life,
     )
 
     engine.add_strategy(strategy_class, setting)
@@ -1158,8 +1262,46 @@ def wrap_evaluate(engine: BacktestingEngine, target_name: str) -> Callable:
         slippage_rates=engine.slippage_rates,
         warmup_start=engine.warmup_start,
         trading_start=engine.trading_start,
+        benchmark_symbol=engine.benchmark_symbol,
+        half_life=engine.half_life,
     )
     return func
+
+
+def calc_rgr_ratio(
+    cagr_value: float,
+    stability_return: float,
+    annual_downside_risk: float,
+    max_drawdown_percent: float,
+    return_skew: float,
+    return_kurt: float,
+    c_var: float,
+) -> float:
+    """Calculate the risk-adjusted growth and resilience ratio."""
+    if cagr_value > 0:
+        gain: float = np.log(1 + cagr_value)
+    else:
+        gain = -np.log(1 - cagr_value)
+
+    skew_factor: float = 1 + 0.1 * np.tanh(return_skew)
+    kurt_factor: float = 1 / (1 + 0.05 * max(return_kurt - 3, 0))
+
+    downside_risk: float = max(annual_downside_risk, 1e-6)
+    max_dd: float = abs(max_drawdown_percent) / 100.0
+    if c_var != 0:
+        cvar_risk: float = abs(c_var)
+    else:
+        cvar_risk = max_dd * 0.5
+    combined_risk: float = 0.5 * downside_risk + 0.3 * max_dd + 0.2 * cvar_risk
+
+    if combined_risk < 1e-9:
+        combined_risk = 1e-9
+
+    rgr_ratio: float = (
+        gain * stability_return * skew_factor * kurt_factor
+    ) / combined_risk
+
+    return rgr_ratio
 
 
 def get_target_value(result: list) -> float:

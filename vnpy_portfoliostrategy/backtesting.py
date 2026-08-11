@@ -12,7 +12,7 @@ from pandas import DataFrame
 from collections.abc import Callable
 
 from vnpy.trader.constant import Direction, Offset, Interval, Status
-from vnpy.trader.database import get_database, BaseDatabase
+from vnpy.trader.database import get_database, BaseDatabase, DB_TZ
 from vnpy.trader.object import OrderData, TradeData, BarData
 from vnpy.trader.utility import round_to, extract_vt_symbol
 from vnpy.trader.optimize import (
@@ -37,6 +37,13 @@ INTERVAL_DELTA_MAP: dict[Interval, timedelta] = {
 }
 
 
+def to_db_timezone(dt: datetime) -> datetime:
+    """Convert a datetime to database-local timezone-aware time."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=DB_TZ)
+    return dt.astimezone(DB_TZ)
+
+
 class BacktestingEngine:
     """组合策略回测引擎"""
 
@@ -48,8 +55,7 @@ class BacktestingEngine:
         self.vt_symbols: list[str] = []
         self.start: datetime
         self.end: datetime
-        self.warmup_start: datetime
-        self.trading_start: datetime | None
+        self.warmup: datetime
         self.benchmark_symbol: str | None = None
         self.benchmark_data: list[BarData] = []
 
@@ -105,6 +111,7 @@ class BacktestingEngine:
         self,
         vt_symbols: list[str],
         interval: Interval,
+        warmup: datetime,
         start: datetime,
         rates: dict[str, float],
         slippages: dict[str, float],
@@ -117,8 +124,6 @@ class BacktestingEngine:
         minimum_commissions: dict[str, float] | None = None,
         stamp_tax_rates: dict[str, float] | None = None,
         slippage_rates: dict[str, float] | None = None,
-        warmup_start: datetime | None = None,
-        trading_start: datetime | None = None,
         benchmark_symbol: str | None = None,
         half_life: int = 120,
     ) -> None:
@@ -160,21 +165,20 @@ class BacktestingEngine:
         self.sizes = sizes
         self.priceticks = priceticks
 
-        self.warmup_start = warmup_start or start
-        self.trading_start = trading_start
+        self.warmup = to_db_timezone(warmup)
+        self.start = to_db_timezone(start)
+        if self.warmup > self.start:
+            raise ValueError("warmup must not be later than start")
         self.benchmark_symbol = benchmark_symbol
         self.benchmark_data.clear()
-        if self.trading_start is not None and self.warmup_start >= self.trading_start:
-            raise ValueError("warmup_start must be earlier than trading_start")
 
-        self.start = self.warmup_start
         if not end:
-            self.end = datetime.now()
+            self.end = datetime.now(DB_TZ)
         else:
-            self.end = end.replace(hour=23, minute=59, second=59)
+            self.end = to_db_timezone(end).replace(hour=23, minute=59, second=59)
 
-        if self.trading_start is not None and self.trading_start >= self.end:
-            raise ValueError("trading_start must be earlier than the backtest end")
+        if self.start >= self.end:
+            raise ValueError("start must be earlier than the backtest end")
 
         self.capital = capital
         self.risk_free = risk_free
@@ -193,9 +197,9 @@ class BacktestingEngine:
         self.output(_("开始加载历史数据"))
 
         if not self.end:
-            self.end = datetime.now()
+            self.end = datetime.now(DB_TZ)
 
-        if self.start >= self.end:
+        if self.warmup >= self.end:
             self.output(_("起始日期必须小于结束日期"))
             return
 
@@ -206,13 +210,13 @@ class BacktestingEngine:
 
         # 每次加载30天历史数据
         progress_delta: timedelta = timedelta(days=30)
-        total_delta: timedelta = self.end - self.start
+        total_delta: timedelta = self.end - self.warmup
         interval_delta: timedelta = INTERVAL_DELTA_MAP[self.interval]
 
         for vt_symbol in self.vt_symbols:
             if self.interval == Interval.MINUTE:
-                start: datetime = self.start
-                end: datetime = self.start + progress_delta
+                start: datetime = self.warmup
+                end: datetime = self.warmup + progress_delta
                 progress: float = 0
 
                 data_count = 0
@@ -244,7 +248,7 @@ class BacktestingEngine:
                 data = load_bar_data(
                     vt_symbol,
                     self.interval,
-                    self.start,
+                    self.warmup,
                     self.end
                 )
 
@@ -270,7 +274,7 @@ class BacktestingEngine:
                 self.benchmark_data = load_bar_data(
                     self.benchmark_symbol,
                     self.interval,
-                    self.start,
+                    self.warmup,
                     self.end,
                 )
 
@@ -284,81 +288,38 @@ class BacktestingEngine:
         self.output(_("所有历史数据加载完成"))
 
     def run_backtesting(self) -> None:
-        if self.trading_start is not None:
-            self._run_backtesting_with_warmup()
-            return
-
-        """开始回测"""
+        """Replay warmup data, then run formal matching and accounting."""
+        self.strategy.inited = False
+        self.strategy.trading = False
         self.strategy.on_init()
-
-        dts: list = list(self.dts)
-        dts.sort()
-
-        # 使用指定时间的历史数据初始化策略
-        day_count: int = 0
-        _ix: int = 0
-
-        for _ix, dt in enumerate(dts):
-            if self.datetime and dt.day != self.datetime.day:
-                day_count += 1
-                if day_count >= self.days:
-                    break
-
-            try:
-                self.new_bars(dt)
-            except Exception:
-                self.output(_("触发异常，回测终止"))
-                self.output(traceback.format_exc())
-                return
-
-        self.strategy.inited = True
-        self.output(_("策略初始化完成"))
-
-        self.strategy.on_start()
-        self.strategy.trading = True
-        self.output(_("开始回放历史数据"))
-
-        # 使用剩余历史数据进行策略回测
-        for dt in dts[_ix:]:
-            try:
-                self.new_bars(dt)
-            except Exception:
-                self.output(_("触发异常，回测终止"))
-                self.output(traceback.format_exc())
-                return
-
-        self.output(_("历史数据回放结束"))
-
-    def _run_backtesting_with_warmup(self) -> None:
-        """Warm indicators before enabling orders and daily result accounting."""
-        self.strategy.on_init()
+        self.output(f"预热日期：{self.warmup}，开始日期：{self.start}")
         dts = sorted(self.dts)
-        trading_start_date = self.trading_start.date()
-        warmup_dts = [dt for dt in dts if dt.date() < trading_start_date]
-        trading_dts = [dt for dt in dts if dt.date() >= trading_start_date]
+        warmup_dts = [dt for dt in dts if dt < self.start]
+        trading_dts = [dt for dt in dts if dt >= self.start]
 
-        if not warmup_dts:
+        if self.warmup < self.start and not warmup_dts:
             raise RuntimeError("no historical bars available for warmup")
         if not trading_dts:
             raise RuntimeError("no historical bars available for formal trading")
 
-        self.output(
-            f"indicator warmup: {warmup_dts[0].date()} to {warmup_dts[-1].date()} "
-            f"({len(warmup_dts)} bars)"
-        )
-        for dt in warmup_dts:
-            try:
-                self.new_bars(dt)
-            except Exception:
-                self.output("exception during warmup; backtest stopped")
-                self.output(traceback.format_exc())
-                return
+        if warmup_dts:
+            self.output(
+                f"indicator warmup: {warmup_dts[0]} to {warmup_dts[-1]} "
+                f"({len(warmup_dts)} bars)"
+            )
+            for dt in warmup_dts:
+                try:
+                    self.new_bars(dt, warmup=True)
+                except Exception:
+                    self.output("exception during warmup; backtest stopped")
+                    self.output(traceback.format_exc())
+                    return
 
         self.strategy.inited = True
         self.output("strategy initialization completed")
         self.strategy.on_start()
         self.strategy.trading = True
-        self.output(f"formal backtest starts at {self.trading_start.date()}")
+        self.output(f"formal backtest starts at {self.start}")
 
         for dt in trading_dts:
             try:
@@ -379,8 +340,13 @@ class BacktestingEngine:
             return
 
         for trade in self.trades.values():
+            if trade.datetime < self.start:
+                continue
+
             d: date = trade.datetime.date()
-            daily_result: PortfolioDailyResult = self.daily_results[d]
+            daily_result: PortfolioDailyResult | None = self.daily_results.get(d)
+            if daily_result is None:
+                continue
             daily_result.add_trade(trade)
 
         pre_closes: dict = {}
@@ -807,7 +773,7 @@ class BacktestingEngine:
         else:
             self.daily_results[d] = PortfolioDailyResult(d, close_prices)
 
-    def new_bars(self, dt: datetime) -> None:
+    def new_bars(self, dt: datetime, warmup: bool = False) -> None:
         """历史数据推送"""
         self.datetime = dt
 
@@ -838,9 +804,10 @@ class BacktestingEngine:
                 self.bars[vt_symbol] = bar
 
         self.strategy.on_bars(bars)
-        self.cross_limit_order()
+        if not warmup:
+            self.cross_limit_order()
 
-        if self.strategy.inited:
+        if self.strategy.inited and not warmup:
             self.update_daily_close(self.bars, dt)
 
     def cross_limit_order(self) -> None:
@@ -1201,6 +1168,7 @@ def evaluate(
     strategy_class: type[StrategyTemplate],
     vt_symbols: list[str],
     interval: Interval,
+    warmup: datetime,
     start: datetime,
     rates: dict[str, float],
     slippages: dict[str, float],
@@ -1212,8 +1180,6 @@ def evaluate(
     minimum_commissions: dict[str, float] | None = None,
     stamp_tax_rates: dict[str, float] | None = None,
     slippage_rates: dict[str, float] | None = None,
-    warmup_start: datetime | None = None,
-    trading_start: datetime | None = None,
     benchmark_symbol: str | None = None,
     half_life: int = 120,
 ) -> tuple:
@@ -1223,6 +1189,7 @@ def evaluate(
     engine.set_parameters(
         vt_symbols=vt_symbols,
         interval=interval,
+        warmup=warmup,
         start=start,
         rates=rates,
         slippages=slippages,
@@ -1233,8 +1200,6 @@ def evaluate(
         minimum_commissions=minimum_commissions,
         stamp_tax_rates=stamp_tax_rates,
         slippage_rates=slippage_rates,
-        warmup_start=warmup_start,
-        trading_start=trading_start,
         benchmark_symbol=benchmark_symbol,
         half_life=half_life,
     )
@@ -1257,6 +1222,7 @@ def wrap_evaluate(engine: BacktestingEngine, target_name: str) -> Callable:
         engine.strategy_class,
         engine.vt_symbols,
         engine.interval,
+        engine.warmup,
         engine.start,
         engine.rates,
         engine.slippages,
@@ -1267,8 +1233,6 @@ def wrap_evaluate(engine: BacktestingEngine, target_name: str) -> Callable:
         minimum_commissions=engine.minimum_commissions,
         stamp_tax_rates=engine.stamp_tax_rates,
         slippage_rates=engine.slippage_rates,
-        warmup_start=engine.warmup_start,
-        trading_start=engine.trading_start,
         benchmark_symbol=engine.benchmark_symbol,
         half_life=engine.half_life,
     )

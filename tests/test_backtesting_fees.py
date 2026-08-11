@@ -36,7 +36,8 @@ class BacktestingFeeDefaultsTest(unittest.TestCase):
         engine.set_parameters(
             vt_symbols=[VT_SYMBOL],
             interval=Interval.DAILY,
-            start=datetime(2024, 1, 1),
+            warmup=datetime(2024, 1, 1),
+            start=datetime(2024, 1, 2),
             rates={VT_SYMBOL: 0.0},
             slippages={VT_SYMBOL: 0.0},
             sizes={VT_SYMBOL: 1.0},
@@ -64,7 +65,8 @@ class BacktestingFeeDefaultsTest(unittest.TestCase):
         engine.set_parameters(
             vt_symbols=[VT_SYMBOL],
             interval=Interval.DAILY,
-            start=datetime(2024, 1, 1),
+            warmup=datetime(2024, 1, 1),
+            start=datetime(2024, 1, 2),
             rates={VT_SYMBOL: 0.0},
             slippages={VT_SYMBOL: 0.0},
             sizes={VT_SYMBOL: 1.0},

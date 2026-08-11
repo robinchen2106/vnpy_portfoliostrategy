@@ -76,6 +76,12 @@ class BacktestingStatisticsTest(unittest.TestCase):
 
         statistics = engine.calculate_statistics(df, output=True)
 
+        self.assertAlmostEqual(df["return"].iloc[0], np.log(1.01))
+        self.assertAlmostEqual(
+            statistics["return_drawdown_ratio"],
+            -statistics["total_return"] / statistics["max_ddpercent"],
+        )
+
         ewm_mean = df["return"].ewm(halflife=2).mean() * 100
         ewm_std = df["return"].ewm(halflife=2).std() * 100
         expected_ewm_sharpe = (ewm_mean / ewm_std).iloc[-1] * np.sqrt(240)

@@ -469,7 +469,11 @@ class BacktestingEngine:
         # 计算资金相关指标
         if df is not None:
             df["balance"] = df["net_pnl"].cumsum() + self.capital
-            df["return"] = np.log(df["balance"] / df["balance"].shift(1)).fillna(0)
+            pre_balance = df["balance"].shift(1)
+            pre_balance.iloc[0] = self.capital
+            x = df["balance"] / pre_balance
+            x[x <= 0] = np.nan
+            df["return"] = np.log(x).fillna(0)
             df["highlevel"] = df["balance"].rolling(min_periods=1, window=len(df), center=False).max()
             df["drawdown"] = df["balance"] - df["highlevel"]
             df["ddpercent"] = df["drawdown"] / df["highlevel"] * 100
@@ -549,7 +553,10 @@ class BacktestingEngine:
                 sharpe_ratio = 0
                 ewm_sharpe = 0
 
-            return_drawdown_ratio = -total_net_pnl / max_drawdown
+            if max_ddpercent:
+                return_drawdown_ratio = -total_return / max_ddpercent
+            else:
+                return_drawdown_ratio = 0
 
             if self.benchmark_data:
                 statistics_start: date = pd.Timestamp(start_date).date()

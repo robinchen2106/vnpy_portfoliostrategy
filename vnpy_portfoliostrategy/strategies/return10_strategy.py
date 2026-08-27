@@ -28,7 +28,10 @@ class Return10Strategy(StrategyTemplate):
     author = "Robin"
 
     price_add_percent = 0.005
-    fixed_pos_value = 50000
+    allocation_mode = "equal_weight"
+    cash_buffer_percent = 0.05
+    max_single_weight = 0.30
+    lot_size = 100
     return_period = 10
     holding_period = 10
     max_positions = 10
@@ -43,7 +46,10 @@ class Return10Strategy(StrategyTemplate):
 
     parameters = [
         "price_add_percent",
-        "fixed_pos_value",
+        "allocation_mode",
+        "cash_buffer_percent",
+        "max_single_weight",
+        "lot_size",
         "return_period",
         "holding_period",
         "max_positions",
@@ -104,13 +110,24 @@ class Return10Strategy(StrategyTemplate):
         self.last_close_tick_at: float = 0.0
 
         # ---- 信号与执行状态（实例级） ----
-        self.pending_targets: dict[str, int] | None = None  # 待执行目标仓位（上一交易日信号）
-        self.executed_date: date | None = None              # 最近一次开盘执行日期（去重）
+        self.pending_targets: dict[str, int] | None = (
+            None  # 待执行目标仓位（上一交易日信号）
+        )
+        self.executed_date: date | None = None  # 最近一次开盘执行日期（去重）
 
         # ---- 实盘日线聚合状态 ----
         self.daily_pending: dict[str, BarData] = {}
         self.daily_agg_date: date | None = None
         self.daily_first_time: datetime | None = None
+
+        if self.allocation_mode != "equal_weight":
+            raise ValueError("allocation_mode must be 'equal_weight'")
+        if not 0 <= self.cash_buffer_percent < 1:
+            raise ValueError("cash_buffer_percent must be in [0, 1)")
+        if not 0 < self.max_single_weight <= 1:
+            raise ValueError("max_single_weight must be in (0, 1]")
+        if self.lot_size <= 0:
+            raise ValueError("lot_size must be positive")
 
     def on_init(self) -> None:
         """策略初始化回调"""
@@ -145,9 +162,9 @@ class Return10Strategy(StrategyTemplate):
         """1分钟K线完成回调 —— 喂给日线生成器继续合成"""
         self.daily_bgs[bar.vt_symbol].update_bar(bar)
 
-    # ------------------------------------------------------------------
-    # K线切片回调：回测（日线）与实盘（分钟切片）分流
-    # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # K线切片回调：回测（日线）与实盘（分钟切片）分流
+        # ------------------------------------------------------------------
         """行情推送回调"""
         self.last_tick_time = tick.datetime.isoformat()
         self.latest_ticks[tick.vt_symbol] = tick
@@ -323,7 +340,7 @@ class Return10Strategy(StrategyTemplate):
     # 信号计算与调仓执行
     # ------------------------------------------------------------------
     def _calc_targets(self, bars: dict[str, BarData]) -> dict[str, int]:
-        """计算目标仓位：更新指标，ROCP 排序取 top max_positions，返回 targets"""
+        """计算目标仓位并按余数分配整手，严格不超过目标资金。"""
         # 1) 更新指标，计算时序信号
         self.cancel_all()
         # 更新K线并计算收益率信号
@@ -357,23 +374,96 @@ class Return10Strategy(StrategyTemplate):
         for vt_symbol in self.vt_symbols:
             self.signal_total[vt_symbol] = 1 if vt_symbol in selected else 0
 
-        # 3) 目标仓位
-        targets: dict[str, int] = {}
-        for vt_symbol, bar in bars.items():
-            if (
+        # 3) 按调仓日最新净资产等权分配，并限制单票集中度
+        portfolio_value = self._portfolio_value()
+        target_weight = 0.0
+        if selected:
+            target_weight = min(
+                (1 - self.cash_buffer_percent) / len(selected),
+                self.max_single_weight,
+            )
+        target_value = portfolio_value * target_weight
+        targets: dict[str, int] = {vt_symbol: 0 for vt_symbol in bars}
+        allocations: list[tuple[float, str, float]] = []
+        base_value = 0.0
+        investment_budget = 0.0
+
+        # First take the floor lot for every selected symbol.  The budget is
+        # the sum of selected target values, so a concentration cap cannot be
+        # consumed by the remainder pass.
+        for vt_symbol in selected:
+            bar = bars.get(vt_symbol)
+            if not bar or not (
                 isinstance(bar.close_price, (int, float))
-                and not math.isnan(bar.close_price)
+                and math.isfinite(bar.close_price)
                 and bar.close_price > 0
             ):
-                targets[vt_symbol] = (
-                    int(self.fixed_pos_value / bar.close_price / 100) * 100
-                    * self.signal_total[vt_symbol]
-                )
-            else:
-                targets[vt_symbol] = 0
+                continue
+
+            price = float(bar.close_price)
+            ideal_lots = target_value / price / self.lot_size
+            floor_lots = math.floor(ideal_lots)
+            remainder = ideal_lots - floor_lots
+            targets[vt_symbol] = floor_lots * self.lot_size
+            base_value += targets[vt_symbol] * price
+            investment_budget += target_value
+            allocations.append((remainder, vt_symbol, price))
+
+        # Keep the hard cash invariant even if the floor allocation ever
+        # exceeds the calculated budget because of unusual caller input.
+        trim_order = sorted(allocations, key=lambda item: (item[0], item[1]))
+        while base_value > investment_budget + 1e-9:
+            trimmed = False
+            for _, vt_symbol, price in trim_order:
+                if targets[vt_symbol]:
+                    targets[vt_symbol] -= self.lot_size
+                    base_value -= self.lot_size * price
+                    trimmed = True
+                if base_value <= investment_budget + 1e-9:
+                    break
+            if not trimmed:
+                break
+
+        remaining_value = max(investment_budget - base_value, 0.0)
+        for _, vt_symbol, price in sorted(
+            (item for item in allocations if item[0] > 1e-12),
+            key=lambda item: (-item[0], item[1]),
+        ):
+            lot_value = self.lot_size * price
+            if lot_value > remaining_value:
+                continue
+            targets[vt_symbol] += self.lot_size
+            remaining_value -= lot_value
 
         self.targets_pos = targets
         return targets
+
+    def _portfolio_value(self) -> float:
+        """读取策略计算时点的最新组合净资产。"""
+        getter = getattr(self.strategy_engine, "get_portfolio_value", None)
+        if getter:
+            try:
+                value = getter(self)
+            except TypeError:
+                value = getter()
+            if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                return float(value)
+
+        main_engine = getattr(self.strategy_engine, "main_engine", None)
+        if main_engine:
+            balances = [
+                float(account.balance)
+                for account in main_engine.get_all_accounts()
+                if math.isfinite(float(account.balance)) and float(account.balance) > 0
+            ]
+            if balances:
+                return balances[0]
+
+        capital = getattr(self.strategy_engine, "capital", None)
+        if isinstance(capital, (int, float)) and math.isfinite(capital) and capital > 0:
+            return float(capital)
+        # Direct unit-test/standalone engines may expose no account object.
+        return float(getattr(self, "initial_capital", 1_000_000))
 
     def _rebalance_by_targets(
         self,

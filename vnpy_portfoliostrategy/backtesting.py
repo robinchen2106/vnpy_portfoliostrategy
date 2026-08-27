@@ -68,6 +68,7 @@ class BacktestingEngine:
         self.priceticks: dict[str, float]
 
         self.capital: float = 1_000_000
+        self.cash: float = self.capital
         self.risk_free: float = 0
         self.annual_days: int = 240
         self.half_life: int = 120
@@ -106,6 +107,7 @@ class BacktestingEngine:
         self.logs.clear()
         self.daily_results.clear()
         self.daily_df = None
+        self.cash = self.capital
 
     def set_parameters(
         self,
@@ -181,6 +183,7 @@ class BacktestingEngine:
             raise ValueError("start must be earlier than the backtest end")
 
         self.capital = capital
+        self.cash = capital
         self.risk_free = risk_free
         self.annual_days = annual_days
         self.half_life = half_life
@@ -870,8 +873,86 @@ class BacktestingEngine:
                 gateway_name=self.gateway_name,
             )
 
+            self.cash += self._trade_cash_change(
+                trade.direction,
+                trade.vt_symbol,
+                trade.price,
+                trade.volume,
+            )
             self.strategy.update_trade(trade)
             self.trades[trade.vt_tradeid] = trade
+
+    def get_portfolio_value(self, strategy: StrategyTemplate | None = None) -> float:
+        """Return current marked-to-market NAV, including orders crossing this bar."""
+        strategy = strategy or self.strategy
+        cash = self.cash
+        positions = dict(strategy.pos_data)
+
+        # Strategy callbacks run before matching. Include orders that will cross
+        # the current bar so holding_period=1 also sizes from the current NAV.
+        for order in self.active_limit_orders.values():
+            bar = self.bars.get(order.vt_symbol)
+            if not bar:
+                continue
+            long_cross = (
+                order.direction == Direction.LONG
+                and order.price >= bar.low_price
+                and bar.low_price > 0
+            )
+            short_cross = (
+                order.direction == Direction.SHORT
+                and order.price <= bar.high_price
+                and bar.high_price > 0
+            )
+            if not long_cross and not short_cross:
+                continue
+            trade_price = (
+                min(order.price, bar.open_price)
+                if long_cross
+                else max(order.price, bar.open_price)
+            )
+            cash += self._trade_cash_change(
+                order.direction,
+                order.vt_symbol,
+                trade_price,
+                order.volume,
+            )
+            position_change = order.volume if long_cross else -order.volume
+            positions[order.vt_symbol] = positions.get(order.vt_symbol, 0) + position_change
+
+        holding_value = sum(
+            positions.get(vt_symbol, 0)
+            * bar.close_price
+            * self.sizes[vt_symbol]
+            for vt_symbol, bar in self.bars.items()
+        )
+        return cash + holding_value
+
+    def _trade_cash_change(
+        self,
+        direction: Direction,
+        vt_symbol: str,
+        price: float,
+        volume: float,
+    ) -> float:
+        size = self.sizes[vt_symbol]
+        turnover = volume * size * price
+        broker_commission = turnover * self.rates[vt_symbol]
+        minimum_commission = self.minimum_commissions[vt_symbol]
+        if minimum_commission > 0:
+            broker_commission = max(broker_commission, minimum_commission)
+        broker_commission = round(broker_commission, 2)
+        stamp_tax = (
+            round(turnover * self.stamp_tax_rates[vt_symbol], 2)
+            if direction == Direction.SHORT
+            else 0.0
+        )
+        slippage = volume * size * self.slippages[vt_symbol]
+        slippage += round(turnover * self.slippage_rates[vt_symbol], 2)
+        costs = broker_commission + stamp_tax + slippage
+        if direction == Direction.LONG:
+            return -turnover - costs
+        return turnover - costs
 
     def load_bars(
         self,

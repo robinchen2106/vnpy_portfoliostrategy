@@ -36,12 +36,15 @@ class Return10Strategy(StrategyTemplate):
     holding_period = 10
     max_positions = 10
     close_wait_seconds = 3.0
+    staggered_rebalance = False
+    rebalance_legs = 2
 
     signal_ts: dict[str, int] = {}
     signal_total: dict[str, int] = {}
     last_tick_time: str = ""
     trade_day: int = 0
     targets_pos: dict[str, int] = {}
+    targets_by_leg: dict[str, dict[str, int]] = {}
     last_daily_bar_date: str = ""
 
     parameters = [
@@ -54,6 +57,8 @@ class Return10Strategy(StrategyTemplate):
         "holding_period",
         "max_positions",
         "close_wait_seconds",
+        "staggered_rebalance",
+        "rebalance_legs",
     ]
     variables = [
         "signal_ts",
@@ -61,6 +66,7 @@ class Return10Strategy(StrategyTemplate):
         "last_tick_time",
         "trade_day",
         "targets_pos",
+        "targets_by_leg",
         "last_daily_bar_date",
     ]
 
@@ -80,6 +86,7 @@ class Return10Strategy(StrategyTemplate):
         self.last_tick_time = ""
         self.trade_day = 0
         self.targets_pos = {}
+        self.targets_by_leg = {"A": {}, "B": {}}
         self.last_daily_bar_date = ""
 
         self.ams: dict[str, ArrayManager] = {}
@@ -128,6 +135,8 @@ class Return10Strategy(StrategyTemplate):
             raise ValueError("max_single_weight must be in (0, 1]")
         if self.lot_size <= 0:
             raise ValueError("lot_size must be positive")
+        if self.rebalance_legs != 2:
+            raise ValueError("rebalance_legs must be 2")
 
     def on_init(self) -> None:
         """策略初始化回调"""
@@ -339,14 +348,29 @@ class Return10Strategy(StrategyTemplate):
     # ------------------------------------------------------------------
     # 信号计算与调仓执行
     # ------------------------------------------------------------------
-    def _calc_targets(self, bars: dict[str, BarData]) -> dict[str, int]:
+    def _calc_targets(
+        self,
+        bars: dict[str, BarData],
+        *,
+        allocation_fraction: float = 1.0,
+        exclude_symbols: set[str] | None = None,
+        max_positions: int | None = None,
+        update_indicators: bool = True,
+    ) -> dict[str, int]:
         """计算目标仓位并按余数分配整手，严格不超过目标资金。"""
+        if not 0 <= allocation_fraction <= 1:
+            raise ValueError("allocation_fraction must be in [0, 1]")
+        exclude_symbols = exclude_symbols or set()
+        position_limit = self.max_positions if max_positions is None else max_positions
+        if position_limit < 0:
+            raise ValueError("max_positions cannot be negative")
         # 1) 更新指标，计算时序信号
         self.cancel_all()
         # 更新K线并计算收益率信号
         for vt_symbol, bar in bars.items():
             am: ArrayManager = self.ams[vt_symbol]
-            am.update_bar(bar)
+            if update_indicators:
+                am.update_bar(bar)
 
             return10 = am.rocp(self.return_period)
             if (
@@ -363,14 +387,14 @@ class Return10Strategy(StrategyTemplate):
         candidates: list[tuple[str, float]] = []
         for vt_symbol, bar in bars.items():
             self.signal_total[vt_symbol] = self.signal_ts[vt_symbol]
-            if self.signal_ts[vt_symbol] > 0:
+            if self.signal_ts[vt_symbol] > 0 and vt_symbol not in exclude_symbols:
                 am = self.ams[vt_symbol]
                 raw_val = am.rocp(self.return_period)
                 if isinstance(raw_val, (int, float)) and not math.isnan(raw_val):
                     candidates.append((vt_symbol, raw_val))
         candidates.sort(key=lambda x: x[1], reverse=True)
 
-        selected: set[str] = {s for s, _ in candidates[: self.max_positions]}
+        selected: set[str] = {s for s, _ in candidates[:position_limit]}
         for vt_symbol in self.vt_symbols:
             self.signal_total[vt_symbol] = 1 if vt_symbol in selected else 0
 
@@ -379,7 +403,7 @@ class Return10Strategy(StrategyTemplate):
         target_weight = 0.0
         if selected:
             target_weight = min(
-                (1 - self.cash_buffer_percent) / len(selected),
+                allocation_fraction * (1 - self.cash_buffer_percent) / len(selected),
                 self.max_single_weight,
             )
         target_value = portfolio_value * target_weight

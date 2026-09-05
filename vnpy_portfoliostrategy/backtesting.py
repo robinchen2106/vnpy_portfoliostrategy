@@ -504,9 +504,7 @@ class BacktestingEngine:
             daily_trade_count = total_trade_count / total_days
 
             total_return = (end_balance / self.capital - 1) * 100
-            annual_return = (
-                (end_balance / self.capital) ** (self.annual_days / total_days) - 1
-            ) * 100
+            annual_return = total_return / total_days * self.annual_days
             daily_return = df["return"].mean() * 100
             return_std = df["return"].std() * 100
 

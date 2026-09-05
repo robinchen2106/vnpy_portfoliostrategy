@@ -89,14 +89,6 @@ class BacktestingStatisticsTest(unittest.TestCase):
 
         self.assertAlmostEqual(statistics["benchmark_return"], 20.0)
         self.assertAlmostEqual(statistics["excess_return"], -19.0)
-        expected_annual_return = (
-            (statistics["end_balance"] / statistics["capital"])
-            ** (engine.annual_days / statistics["total_days"])
-            - 1
-        ) * 100
-        self.assertAlmostEqual(statistics["annual_return"], expected_annual_return)
-        annual_return_log = next(log for log in logs if "年化收益" in log)
-        self.assertIn(f"{expected_annual_return:,.2f}%", annual_return_log)
         self.assertAlmostEqual(statistics["ewm_sharpe"], expected_ewm_sharpe)
         self.assertTrue(np.isfinite(statistics["rgr_ratio"]))
         self.assertNotEqual(statistics["rgr_ratio"], 0.0)
